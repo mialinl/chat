@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   sync:
@@ -19,10 +20,54 @@ jobs:
           fetch-depth: 0
 
       - name: Merge updates from upstream
+        id: merge
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.quotePath false
           git remote add upstream https://github.com/channel-ing/chat.git
           git fetch upstream main
-          git merge upstream/main --no-edit
+
+          if git merge upstream/main --no-edit; then
+            git push origin main
+            exit 0
+          fi
+
+          # 有冲突：冲突的文件整个改用上游版本（不做逐行拼接，避免两边代码混在一起）
+          CONFLICTS=$(git diff --name-only --diff-filter=U)
+          while IFS= read -r f; do
+            if git cat-file -e "upstream/main:$f" 2>/dev/null; then
+              git checkout upstream/main -- "$f"
+            else
+              git rm -q -- "$f"
+            fi
+          done <<< "$CONFLICTS"
+          git commit --no-edit
           git push origin main
+
+          {
+            echo "conflicts<<EOF"
+            echo "$CONFLICTS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open issue about overwritten files
+        if: steps.merge.outputs.conflicts != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          {
+            echo "@$OWNER 今天同步上游（\`$UPSTREAM_SHA\`）时，下面这些文件和你自己的修改冲突了，已经**整个改用上游版本**，你在这些文件里的修改被覆盖了："
+            echo
+            echo "$CONFLICTS" | sed 's/^/- `/; s/$/`/'
+            echo
+            echo "其他文件照常合并，网站已经是最新的。"
+            echo "如果上游已经修好了你原来改的问题，直接关掉这个 issue 就行；如果还需要你的修改，可以在这些文件上重新改一次。"
+          } > body.md
+          gh issue create \
+            --title "同步上游：$(echo "$CONFLICTS" | wc -l) 个文件改用了上游版本" \
+            --body-file body.md \
+            --assignee "$OWNER"
