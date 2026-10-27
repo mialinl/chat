@@ -215,7 +215,25 @@
         }
     }
 
+    // 估算单个值占用的字节数：字符串/二进制直接取长度，只有普通对象才 JSON.stringify
+    function sizeOf(raw) {
+        if (raw == null) return 0;
+        if (typeof raw === 'string') return raw.length * 2;
+        if (typeof Blob !== 'undefined' && raw instanceof Blob) return raw.size;
+        if (raw instanceof ArrayBuffer) return raw.byteLength;
+        if (ArrayBuffer.isView && ArrayBuffer.isView(raw)) return raw.byteLength;
+        try { return (JSON.stringify(raw) || '').length * 2; } catch (e) { return 0; }
+    }
+
+    // 打开数据管理时 updateStats 会被三处同时触发（style 监听 / showModal 包装 / 入口点击），
+    // 以前每次都 Promise.all 把整个 localforage（聊天记录、表情包、收藏语音、背景图…）一次性读进内存，
+    // 三份叠加，数据一多手机浏览器就内存爆掉闪退。现在：同一时间只跑一轮，并且逐个 key 读取。
+    var _statsRunning = false;
+
     function updateStats() {
+        if (_statsRunning) return;
+        _statsRunning = true;
+        var done = function () { _statsRunning = false; };
         var total = 0, msgs = 0, cfg = 0, media = 0;
         var processLS = function () {
             for (var i = 0; i < localStorage.length; i++) {
@@ -228,37 +246,36 @@
                 else cfg += bytes;
             }
             applyStats(total, msgs, cfg, media);
+            done();
+        };
+        var fallback = function () {
+            total = 0; msgs = 0; cfg = 0; media = 0;
+            processLS();
         };
         try {
             if (window.localforage) {
                 localforage.keys().then(function (keys) {
-                    var promises = keys.map(function (k) {
-                        // favAudio_ 是音频 Base64 或 oss:// 引用，直接估算大小，不读内容避免内存爆炸
-                        // 阶段四：键名格式变为 CHAT_APP_V3_<SID>_favAudio_<msgId>，兼容旧格式
-                        if (k.startsWith('favAudio_') || k.includes('_favAudio_')) {
-                            return localforage.getItem(k).then(function(raw) {
-                                var bytes = typeof raw === 'string' ? raw.length * 2 : 0;
-                                return { k: k, b: bytes };
-                            }).catch(function() { return { k: k, b: 0 }; });
+                    var i = 0;
+                    // 逐个读：同一时刻内存里只有一个值，读完即可被回收
+                    var next = function () {
+                        if (i >= keys.length) {
+                            applyStats(total, msgs, cfg, media);
+                            done();
+                            return;
                         }
-                        return localforage.getItem(k).then(function (raw) {
-                            if (raw == null) return { k: k, b: 0 };
-                            var str = typeof raw === 'string' ? raw : JSON.stringify(raw);
-                            return { k: k, b: (k.length + str.length) * 2 };
-                        });
-                    });
-                    Promise.all(promises).then(function (results) {
-                        results.forEach(function (r) {
-                            total += r.b;
-                            if (/messages|msgs|session/i.test(r.k)) msgs += r.b;
-                            else if (/avatar|image|photo|bg|background|wallpaper/i.test(r.k)) media += r.b;
-                            else cfg += r.b;
-                        });
-                        applyStats(total, msgs, cfg, media);
-                    }).catch(processLS);
-                }).catch(processLS);
+                        var k = keys[i++];
+                        localforage.getItem(k).then(function (raw) {
+                            var b = raw == null ? 0 : k.length * 2 + sizeOf(raw);
+                            total += b;
+                            if (/messages|msgs|session/i.test(k)) msgs += b;
+                            else if (/avatar|image|photo|bg|background|wallpaper/i.test(k)) media += b;
+                            else cfg += b;
+                        }).catch(function () {}).then(next);
+                    };
+                    next();
+                }).catch(fallback);
             } else { processLS(); }
-        } catch (e) { processLS(); }
+        } catch (e) { fallback(); }
     }
 
     function syncToggles() {
